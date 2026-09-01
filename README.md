@@ -2,7 +2,7 @@
 
 这是一个学习型但接近生产分层的 Python 后端项目。它围绕“创建并运行 AI Agent 任务”这一条业务主线，串联 FastAPI、Pydantic、SQLAlchemy 2.x、PostgreSQL、Alembic、JWT、事务、后台任务与 SSE。
 
-当前实施状态：**第一阶段已完成**。项目骨架、配置、日志、中间件、统一业务异常、Docker Compose 和学习路线已经建立；数据库、认证和 Agent 业务将在后续阶段逐步加入。
+当前实施状态：**第二阶段已完成**。项目已具备 PostgreSQL ORM、Session 生命周期、Repository 数据访问层以及可执行、可回滚的 Alembic 初始迁移；认证和 Agent 业务将在第三阶段加入。
 
 ## 技术栈
 
@@ -28,7 +28,7 @@ ai-agent-task-platform/
 │   ├── services/               # 业务规则与事务边界
 │   ├── middlewares/            # 请求上下文中间件
 │   └── utils/                  # 通用工具
-├── alembic/                    # 数据库迁移（第二阶段加入）
+├── alembic/                    # Alembic 迁移脚本与版本历史
 ├── tests/                      # pytest 测试
 ├── AGENTS.md                   # 项目协作约束
 ├── LEARNING_PATH.md            # 中文学习路线
@@ -100,15 +100,54 @@ cp .env.example .env
 
 ### 5. 数据库迁移
 
-第二阶段会生成可直接执行的初始迁移：
+初始迁移已经提交在 `alembic/versions/`。新环境请执行：
 
 ```bash
 alembic upgrade head
+```
+
+模型发生结构变化后，再生成新的迁移并执行：
+
+```bash
+alembic revision --autogenerate -m "describe schema change"
+alembic upgrade head
+```
+
+学习或本地验证时可以回滚最近一版：
+
+```bash
 alembic downgrade -1
-alembic revision --autogenerate -m "init tables"
 ```
 
 生产环境不能使用 `Base.metadata.create_all()` 管理表结构。`create_all()` 不会形成可审核、可回滚的版本历史，生产改表必须通过 Alembic migration。
+
+## 第二阶段：数据库模型与迁移
+
+初始 migration 创建以下四张表：
+
+- `users`：用户名唯一索引，密码字段仅用于保存哈希值。
+- `agent_tasks`：通过 `user_id` 外键关联用户，包含 `task_id` 唯一索引、`user_id` 索引和 `(user_id, status, created_at)` 联合索引。
+- `agent_messages`：按业务 `task_id` 记录对话消息。
+- `agent_tool_calls`：按业务 `task_id` 记录工具调用，`tool_args` 与 `tool_result` 使用 PostgreSQL `JSONB`。
+
+可在 PostgreSQL 容器中确认表和索引：
+
+```powershell
+docker compose exec postgres psql -U postgres -d agent_task_db -c "\dt"
+docker compose exec postgres psql -U postgres -d agent_task_db -c "\d agent_tasks"
+```
+
+### Session 生命周期与事务边界
+
+`app/db/session.py` 中的 `get_db()` 是 FastAPI 的 `yield` 依赖。每次请求获得一个独立的 `Session`：业务正常结束时由 Service 层决定 `commit()`；请求抛出异常时依赖执行 `rollback()`；无论成功或失败都会 `close()`。
+
+Repository 从参数接收 `Session`，不引用全局 Session。这样一个 Service 能把“创建任务”和“创建首条消息”放在同一事务中；第三阶段中任一步失败时回滚，避免只写入半份数据。
+
+### ForeignKey 与 relationship
+
+`ForeignKey("users.id")` 是 PostgreSQL 的数据库约束，它保证 `agent_tasks.user_id` 指向真实用户。`relationship()` 是 SQLAlchemy 在 Python 中提供的对象导航：`user.tasks` 与 `task.user` 方便读写关联对象，但不会替代数据库外键。
+
+消息和工具调用采用对外业务 ID `task_id` 查询，便于后续接口直接按任务 ID 获取记录；当前需求没有为它们增加数据库外键。
 
 ### 6. 启动 FastAPI
 
@@ -147,10 +186,8 @@ X-Process-Time: ...
 
 ## 后续将补充的核心说明
 
-完成第二至第四阶段时，本 README 会继续加入：
+第三、四阶段会继续加入：
 
-- SQLAlchemy Session 的创建、commit、rollback 和 close 生命周期
-- ForeignKey 与 relationship 的职责区别
 - FastAPI BackgroundTasks 的适用范围与生产限制
 - Agent 任务的原子状态更新与取消竞争处理
 - PostgreSQL 索引与 `EXPLAIN ANALYZE` 学习示例

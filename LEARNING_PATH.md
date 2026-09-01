@@ -63,6 +63,14 @@
 
 重点练习：人为让“创建任务后的消息写入”失败，确认任务也没有被提交，从而理解原子事务。
 
+第二阶段对应文件：
+
+- `app/db/base.py`：`Base.metadata` 是 Alembic 发现模型的入口。
+- `app/db/models.py`：四张表、索引、外键与 `relationship` 的定义。
+- `app/db/session.py`：每个请求如何获得、回滚并关闭独立 Session。
+- `app/repositories/`：Repository 为什么接收 Session 参数而不依赖全局对象。
+- `alembic/versions/`：数据库结构怎样被记录为可升级、可回滚的历史。
+
 ## 第 4 站：理解认证与依赖注入
 
 目标：理解 JWT 解决了什么、没有解决什么。
