@@ -2,7 +2,7 @@
 
 这是一个学习型但接近生产分层的 Python 后端项目。它围绕“创建并运行 AI Agent 任务”这一条业务主线，串联 FastAPI、Pydantic、SQLAlchemy 2.x、PostgreSQL、Alembic、JWT、事务、后台任务与 SSE。
 
-当前实施状态：**第二阶段已完成**。项目已具备 PostgreSQL ORM、Session 生命周期、Repository 数据访问层以及可执行、可回滚的 Alembic 初始迁移；认证和 Agent 业务将在第三阶段加入。
+当前实施状态：**第三阶段已完成**。项目已具备 JWT 认证、Agent 任务 API、事务边界、原子状态更新和轻量后台模拟任务；SSE 与完整 pytest 覆盖将在第四阶段加入。
 
 ## 技术栈
 
@@ -123,7 +123,7 @@ alembic downgrade -1
 
 ## 第二阶段：数据库模型与迁移
 
-初始 migration 创建以下四张表：
+当前 migration 创建以下四张表，并已加入任务优先级 `priority` 字段：
 
 - `users`：用户名唯一索引，密码字段仅用于保存哈希值。
 - `agent_tasks`：通过 `user_id` 外键关联用户，包含 `task_id` 唯一索引、`user_id` 索引和 `(user_id, status, created_at)` 联合索引。
@@ -141,7 +141,7 @@ docker compose exec postgres psql -U postgres -d agent_task_db -c "\d agent_task
 
 `app/db/session.py` 中的 `get_db()` 是 FastAPI 的 `yield` 依赖。每次请求获得一个独立的 `Session`：业务正常结束时由 Service 层决定 `commit()`；请求抛出异常时依赖执行 `rollback()`；无论成功或失败都会 `close()`。
 
-Repository 从参数接收 `Session`，不引用全局 Session。这样一个 Service 能把“创建任务”和“创建首条消息”放在同一事务中；第三阶段中任一步失败时回滚，避免只写入半份数据。
+Repository 从参数接收 `Session`，不引用全局 Session。Service 能把“创建任务”和“创建首条消息”放在同一事务中；任一步失败时回滚，避免只写入半份数据。
 
 ### ForeignKey 与 relationship
 
@@ -159,13 +159,97 @@ uvicorn app.main:app --reload
 - Swagger：<http://127.0.0.1:8000/docs>
 - OpenAPI JSON：<http://127.0.0.1:8000/openapi.json>
 
-## 当前可用接口
+## 第三阶段：认证与任务接口
 
 ```text
 GET /health
+
+POST /api/v1/auth/register
+POST /api/v1/auth/login
+GET  /api/v1/auth/me
+
+POST /api/v1/agent/tasks
+GET  /api/v1/agent/tasks
+GET  /api/v1/agent/tasks/{task_id}
+POST /api/v1/agent/tasks/{task_id}/run
+POST /api/v1/agent/tasks/{task_id}/cancel
+GET  /api/v1/agent/tasks/{task_id}/messages
+GET  /api/v1/agent/tasks/{task_id}/tool-calls
 ```
 
-响应：
+### 注册、登录与 Bearer Token
+
+```json
+POST /api/v1/auth/register
+{
+  "username": "tom",
+  "email": "tom@example.com",
+  "password": "123456"
+}
+```
+
+登录成功后返回：
+
+```json
+{
+  "access_token": "xxx",
+  "token_type": "bearer"
+}
+```
+
+受保护接口必须携带：
+
+```text
+Authorization: Bearer <access_token>
+```
+
+JWT 内含 `user_id`、`username` 与过期时间。它是签名令牌而非加密容器，不能写入密码或其他敏感信息。密码仅以 bcrypt 哈希形式保存。
+
+### 创建与运行任务
+
+```json
+POST /api/v1/agent/tasks
+{
+  "prompt": "帮我分析今天的广告投放效果",
+  "priority": 0
+}
+```
+
+`priority` 是第二阶段的改表练习字段，取值范围为 0 到 10，未提供时默认 0。创建任务会在一个事务内写入 `agent_tasks` 和第一条 `user` 消息。
+
+运行接口成功返回 HTTP `202 Accepted` 和 `running` 状态。它通过条件更新抢占任务：
+
+```sql
+UPDATE agent_tasks
+SET status = 'running'
+WHERE task_id = :task_id
+  AND user_id = :user_id
+  AND status = 'created';
+```
+
+只有一个并发请求能更新到一行；另一个请求会得到统一的 `INVALID_TASK_STATUS` 错误。后台模拟完成后会写入 assistant 消息、工具调用和 answer，并将任务设为 `success`。
+
+取消只允许 `created` 或 `running` 状态。后台写入成功结果时还会再次要求状态为 `running`，因此取消先成功时不会被后台任务覆盖。
+
+### curl 示例
+
+PowerShell 中可以先保存登录后得到的 token：
+
+```powershell
+$login = Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8000/api/v1/auth/login `
+  -ContentType "application/json" `
+  -Body '{"username":"tom","password":"123456"}'
+$headers = @{ Authorization = "Bearer $($login.access_token)" }
+
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8000/api/v1/agent/tasks `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body '{"prompt":"分析广告投放效果","priority":0}'
+```
+
+`GET /health` 响应：
 
 ```json
 {
@@ -184,13 +268,17 @@ X-Request-ID: ...
 X-Process-Time: ...
 ```
 
+## BackgroundTasks 的边界
+
+本项目的运行接口使用 FastAPI `BackgroundTasks` 模拟耗时任务。后台函数自行创建短生命周期 `Session`，不能使用已结束请求提供的 Session。
+
+`BackgroundTasks` 只适合短小、可容忍随 Web 进程重启而中断的任务。生产中的长时间 AI Agent 任务应使用 Celery、RQ、Dramatiq、Kafka Consumer 等独立任务队列，并将状态持久化到数据库。当前项目刻意不引入这些组件，以专注基础事务与并发模型。
+
 ## 后续将补充的核心说明
 
 第三、四阶段会继续加入：
 
-- FastAPI BackgroundTasks 的适用范围与生产限制
-- Agent 任务的原子状态更新与取消竞争处理
 - PostgreSQL 索引与 `EXPLAIN ANALYZE` 学习示例
-- 全部认证、任务、消息、工具调用和 SSE 接口
+- SSE 流式输出和完整 pytest 测试结构
 
 完整学习顺序参见 [LEARNING_PATH.md](LEARNING_PATH.md)。

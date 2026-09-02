@@ -49,7 +49,7 @@
   -> 客户端
 ```
 
-第三阶段完成后，选取 `POST /api/v1/agent/tasks`，从路由开始逐层追踪，不要一开始横向读完所有文件。
+现在可以选取 `POST /api/v1/agent/tasks`，从路由开始逐层追踪，不要一开始横向读完所有文件。
 
 ## 第 3 站：理解数据库模型和 Session
 
@@ -83,6 +83,15 @@
 
 不要把敏感信息放进 JWT。JWT 默认只是签名而非加密，客户端能够读取载荷。
 
+第三阶段对应文件：
+
+- `app/api/v1/auth_api.py`：注册、登录和 `/me` 的 HTTP 输入输出。
+- `app/services/auth_service.py`：用户名冲突、密码校验与注册事务。
+- `app/core/security.py`：bcrypt、JWT 签发与 `get_current_user()`。
+- `app/schemas/auth_schema.py`：请求验证和不含 `password_hash` 的响应模型。
+
+动手顺序：先注册用户，再登录拿到 token，最后带着 `Authorization: Bearer <token>` 调用 `/api/v1/auth/me`。故意删除 Header 再请求一次，观察统一的 401 响应。
+
 ## 第 5 站：理解并发安全和后台任务
 
 目标：理解“先查询再更新”为何可能重复运行任务。
@@ -100,6 +109,15 @@ WHERE task_id = :task_id
 
 取消运行中任务时，模拟工作完成前还要重新检查状态，避免把 `cancelled` 覆盖成 `success`。
 
+第三阶段对应文件：
+
+- `app/api/v1/agent_api.py`：任务接口与 `BackgroundTasks` 注册位置。
+- `app/services/agent_task_service.py`：创建任务事务、资源归属和状态机。
+- `app/repositories/agent_task_repository.py`：原子条件 `UPDATE` 的具体实现。
+- `app/schemas/agent_schema.py`：任务、消息和工具调用的公开响应结构。
+
+建议练习：创建同一任务后快速发送两次 `/run`。其中一个请求应返回 202，另一个应返回 `INVALID_TASK_STATUS`。随后查询 messages 和 tool-calls，理解后台任务写入了哪些数据。
+
 ## 第 6 站：理解 SSE 与流式响应
 
 目标：区分普通 JSON 响应和逐块传输。
@@ -109,6 +127,8 @@ SSE 使用 `text/event-stream`，服务端以 `data: ...\n\n` 逐条发送事件
 - async generator 如何逐步 yield 数据。
 - 客户端断开后生成器如何结束。
 - 为什么最终发送 `[DONE]` 是应用协议约定，而不是 SSE 标准强制要求。
+
+本项目会在第四阶段实现该接口；在此之前先完成认证和任务状态机练习。
 
 ## 第 7 站：理解迁移、索引和 EXPLAIN
 
